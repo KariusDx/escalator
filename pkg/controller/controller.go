@@ -215,6 +215,11 @@ func (c *Controller) scaleNodeGroup(nodegroup string, nodeGroup *NodeGroupState)
 	metrics.NodeGroupNodesTainted.WithLabelValues(nodegroup).Set(float64(len(taintedNodes)))
 	metrics.NodeGroupPods.WithLabelValues(nodegroup).Set(float64(len(pods)))
 
+
+	nodesDelta := 0
+
+	//Below to calcualte the nodes delta.
+
 	// We want to be really simple right now so we don't do anything if we are outside the range of allowed nodes
 	// We assume it is a config error or something bad has gone wrong in the cluster
 	if len(untaintedNodes) == 0 {
@@ -230,138 +235,116 @@ func (c *Controller) scaleNodeGroup(nodegroup string, nodeGroup *NodeGroupState)
 				return nodeGroup.scaleUpLock.requestedNodes, nil
 			}
 
-			var nodesDelta= nodeGroup.Opts.ScaleUpInitNodes
+			nodesDelta= nodeGroup.Opts.ScaleUpInitNodes
 
-			scaleOptions := scaleOpts{
-				nodes:          allNodes,
-				taintedNodes:   taintedNodes,
-				untaintedNodes: untaintedNodes,
-				nodeGroup:      nodeGroup,
-				nodesDelta:     nodesDelta,
-			}
 
-			var nodesDeltaResult, actionErr= c.ScaleUp(scaleOptions)
-
-			if actionErr != nil {
-				switch actionErr.(type) {
-				// early return when node is NOT in expected node group
-				case *cloudprovider.NodeNotInNodeGroup:
-					return 0, actionErr
-				default:
-					log.WithField("nodegroup", nodegroup).Error(actionErr)
-				}
-			}
-			log.WithField("nodegroup", nodegroup).Debugf("DeltaScaled: %v", nodesDeltaResult)
-
-			nodeGroup.lastScaleOut = time.Now()
-
-			return nodesDelta, nil
 		} else {
-			return 0, nil
+			nodesDelta = -nodeGroup.Opts.FastNodeRemovalRate
 		}
-	}
-	if len(allNodes) < nodeGroup.Opts.MinNodes {
-		err = errors.New("node count less than the minimum")
-		log.WithField("nodegroup", nodegroup).Warningf(
-			"Node count of %v less than minimum of %v",
-			len(allNodes),
-			nodeGroup.Opts.MinNodes,
-		)
-		return 0, err
-	}
-	if len(allNodes) > nodeGroup.Opts.MaxNodes {
-		err = errors.New("node count larger than the maximum")
-		log.WithField("nodegroup", nodegroup).Warningf(
-			"Node count of %v larger than maximum of %v",
-			len(allNodes),
-			nodeGroup.Opts.MaxNodes,
-		)
-		return 0, err
-	}
+	} else {
+		if len(allNodes) < nodeGroup.Opts.MinNodes {
+			err = errors.New("node count less than the minimum")
+			log.WithField("nodegroup", nodegroup).Warningf(
+				"Node count of %v less than minimum of %v",
+				len(allNodes),
+				nodeGroup.Opts.MinNodes,
+			)
+			return 0, err
+		}
+		if len(allNodes) > nodeGroup.Opts.MaxNodes {
+			err = errors.New("node count larger than the maximum")
+			log.WithField("nodegroup", nodegroup).Warningf(
+				"Node count of %v larger than maximum of %v",
+				len(allNodes),
+				nodeGroup.Opts.MaxNodes,
+			)
+			return 0, err
+		}
 
-	// update the map of node to nodeinfo
-	// for working out which pods are on which nodes
-	nodeGroup.NodeInfoMap = k8s.CreateNodeNameToInfoMap(pods, allNodes)
+		// update the map of node to nodeinfo
+		// for working out which pods are on which nodes
+		nodeGroup.NodeInfoMap = k8s.CreateNodeNameToInfoMap(pods, allNodes)
 
-	// Calc capacity for untainted nodes
-	memRequest, cpuRequest, err := k8s.CalculatePodsRequestsTotal(pods)
-	if err != nil {
-		log.Errorf("Failed to calculate requests: %v", err)
-		return 0, err
-	}
-	memCapacity, cpuCapacity, err := k8s.CalculateNodesCapacityTotal(untaintedNodes)
-	if err != nil {
-		log.Errorf("Failed to calculate capacity: %v", err)
-		return 0, err
-	}
-
-	// Metrics
-	metrics.NodeGroupCPURequest.WithLabelValues(nodegroup).Set(float64(cpuRequest.MilliValue()))
-	metrics.NodeGroupCPUCapacity.WithLabelValues(nodegroup).Set(float64(cpuCapacity.MilliValue()))
-	metrics.NodeGroupMemCapacity.WithLabelValues(nodegroup).Set(float64(memCapacity.MilliValue() / 1000))
-	metrics.NodeGroupMemRequest.WithLabelValues(nodegroup).Set(float64(memRequest.MilliValue() / 1000))
-
-	// If we ever get into a state where we have less nodes than the minimum
-	if len(untaintedNodes) < nodeGroup.Opts.MinNodes {
-		log.WithField("nodegroup", nodegroup).Warn("There are less untainted nodes than the minimum")
-		result, err := c.ScaleUp(scaleOpts{
-			nodes:      allNodes,
-			nodesDelta: nodeGroup.Opts.MinNodes - len(untaintedNodes),
-			nodeGroup:  nodeGroup,
-		})
+		// Calc capacity for untainted nodes
+		memRequest, cpuRequest, err := k8s.CalculatePodsRequestsTotal(pods)
 		if err != nil {
-			log.WithField("nodegroup", nodegroup).Error(err)
+			log.Errorf("Failed to calculate requests: %v", err)
+			return 0, err
 		}
-		return result, err
-	}
-
-	// Calc %
-	cpuPercent, memPercent, err := calcPercentUsage(cpuRequest, memRequest, cpuCapacity, memCapacity)
-	if err != nil {
-		log.Errorf("Failed to calculate percentages: %v", err)
-		return 0, err
-	}
-
-	// Metrics
-	log.WithField("nodegroup", nodegroup).Infof("cpu: %v, memory: %v", cpuPercent, memPercent)
-	metrics.NodeGroupsCPUPercent.WithLabelValues(nodegroup).Set(cpuPercent)
-	metrics.NodeGroupsMemPercent.WithLabelValues(nodegroup).Set(memPercent)
-
-	locked := nodeGroup.scaleUpLock.locked()
-	if locked {
-		// don't do anything else until we're unlocked again
-		log.WithField("nodegroup", nodegroup).Info(nodeGroup.scaleUpLock)
-		log.WithField("nodegroup", nodegroup).Info("Waiting for scale to finish")
-		return nodeGroup.scaleUpLock.requestedNodes, nil
-	}
-
-	c.calculateNewNodeMetrics(nodegroup, nodeGroup)
-
-	// Perform the scaling decision
-	maxPercent := math.Max(cpuPercent, memPercent)
-	nodesDelta := 0
-
-	// Determine if we want to scale up or down. Selects the first condition that is true
-	switch {
-	// --- Scale Down conditions ---
-	// reached very low %. aggressively remove nodes
-	case maxPercent < float64(nodeGroup.Opts.TaintLowerCapacityThresholdPercent):
-		nodesDelta = -nodeGroup.Opts.FastNodeRemovalRate
-	// reached medium low %. slowly remove nodes
-	case maxPercent < float64(nodeGroup.Opts.TaintUpperCapacityThresholdPercent):
-		nodesDelta = -nodeGroup.Opts.SlowNodeRemovalRate
-	// --- Scale Up conditions ---
-	// Need to scale up so capacity can handle requests
-	case maxPercent > float64(nodeGroup.Opts.ScaleUpThresholdPercent):
-		// if ScaleUpThresholdPercent is our "max target" or "slack capacity"
-		// we want to add enough nodes such that the maxPercentage cluster util
-		// drops back below ScaleUpThresholdPercent
-		nodesDelta, err = calcScaleUpDelta(untaintedNodes, cpuPercent, memPercent, nodeGroup)
+		memCapacity, cpuCapacity, err := k8s.CalculateNodesCapacityTotal(untaintedNodes)
 		if err != nil {
-			log.Errorf("Failed to calculate node delta: %v", err)
-			return nodesDelta, err
+			log.Errorf("Failed to calculate capacity: %v", err)
+			return 0, err
+		}
+
+		// Metrics
+		metrics.NodeGroupCPURequest.WithLabelValues(nodegroup).Set(float64(cpuRequest.MilliValue()))
+		metrics.NodeGroupCPUCapacity.WithLabelValues(nodegroup).Set(float64(cpuCapacity.MilliValue()))
+		metrics.NodeGroupMemCapacity.WithLabelValues(nodegroup).Set(float64(memCapacity.MilliValue() / 1000))
+		metrics.NodeGroupMemRequest.WithLabelValues(nodegroup).Set(float64(memRequest.MilliValue() / 1000))
+
+		// If we ever get into a state where we have less nodes than the minimum
+		if len(untaintedNodes) < nodeGroup.Opts.MinNodes {
+			log.WithField("nodegroup", nodegroup).Warn("There are less untainted nodes than the minimum")
+			result, err := c.ScaleUp(scaleOpts{
+				nodes:      allNodes,
+				nodesDelta: nodeGroup.Opts.MinNodes - len(untaintedNodes),
+				nodeGroup:  nodeGroup,
+			})
+			if err != nil {
+				log.WithField("nodegroup", nodegroup).Error(err)
+			}
+			return result, err
+		}
+
+		// Calc %
+		cpuPercent, memPercent, err := calcPercentUsage(cpuRequest, memRequest, cpuCapacity, memCapacity)
+		if err != nil {
+			log.Errorf("Failed to calculate percentages: %v", err)
+			return 0, err
+		}
+
+		// Metrics
+		log.WithField("nodegroup", nodegroup).Infof("cpu: %v, memory: %v", cpuPercent, memPercent)
+		metrics.NodeGroupsCPUPercent.WithLabelValues(nodegroup).Set(cpuPercent)
+		metrics.NodeGroupsMemPercent.WithLabelValues(nodegroup).Set(memPercent)
+
+		locked := nodeGroup.scaleUpLock.locked()
+		if locked {
+			// don't do anything else until we're unlocked again
+			log.WithField("nodegroup", nodegroup).Info(nodeGroup.scaleUpLock)
+			log.WithField("nodegroup", nodegroup).Info("Waiting for scale to finish")
+			return nodeGroup.scaleUpLock.requestedNodes, nil
+		}
+
+		c.calculateNewNodeMetrics(nodegroup, nodeGroup)
+
+		// Perform the scaling decision
+		maxPercent := math.Max(cpuPercent, memPercent)
+
+		// Determine if we want to scale up or down. Selects the first condition that is true
+		switch {
+		// --- Scale Down conditions ---
+		// reached very low %. aggressively remove nodes
+		case maxPercent < float64(nodeGroup.Opts.TaintLowerCapacityThresholdPercent):
+			nodesDelta = -nodeGroup.Opts.FastNodeRemovalRate
+		// reached medium low %. slowly remove nodes
+		case maxPercent < float64(nodeGroup.Opts.TaintUpperCapacityThresholdPercent):
+			nodesDelta = -nodeGroup.Opts.SlowNodeRemovalRate
+		// --- Scale Up conditions ---
+		// Need to scale up so capacity can handle requests
+		case maxPercent > float64(nodeGroup.Opts.ScaleUpThresholdPercent):
+			// if ScaleUpThresholdPercent is our "max target" or "slack capacity"
+			// we want to add enough nodes such that the maxPercentage cluster util
+			// drops back below ScaleUpThresholdPercent
+			nodesDelta, err = calcScaleUpDelta(untaintedNodes, cpuPercent, memPercent, nodeGroup)
+			if err != nil {
+				log.Errorf("Failed to calculate node delta: %v", err)
+				return nodesDelta, err
+			}
 		}
 	}
+
 
 	log.WithField("nodegroup", nodegroup).Debugf("Delta: %v", nodesDelta)
 
