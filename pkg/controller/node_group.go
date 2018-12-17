@@ -40,6 +40,8 @@ type NodeGroupOptions struct {
 
 	ScaleUpCoolDownPeriod string `json:"scale_up_cool_down_period,omitempty" yaml:"scale_up_cool_down_period,omitempty"`
 
+	ScaleUpInitNodes int `json:"scale_up_init_nodes,omitempty" yaml:"scale_up_init_nodes,omitempty"`
+
 	// Private variables for storing the parsed duration from the string
 	softDeleteGracePeriodDuration time.Duration
 	hardDeleteGracePeriodDuration time.Duration
@@ -98,6 +100,7 @@ func ValidateNodeGroup(nodegroup NodeGroupOptions) []error {
 	checkThat(nodegroup.SoftDeleteGracePeriodDuration() < nodegroup.HardDeleteGracePeriodDuration(), "soft_delete_grace_period must be less than hard_delete_grace_period")
 
 	checkThat(len(nodegroup.ScaleUpCoolDownPeriod) > 0, "scale_up_cool_down_period must not be empty")
+	checkThat(nodegroup.ScaleUpInitNodes > 0, "scale_up_cool_down_period must not be empty")
 	checkThat(nodegroup.ScaleUpCoolDownPeriodDuration() > 0, "soft_delete_grace_period failed to parse into a time.Duration. check your formatting.")
 
 	return problems

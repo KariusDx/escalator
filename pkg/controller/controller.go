@@ -135,6 +135,7 @@ func (c *Controller) filterNodes(nodeGroup *NodeGroupState, allNodes []*v1.Node)
 			// If the node is Unschedulable (cordoned), separate it out from the tainted/untainted
 			if node.Spec.Unschedulable {
 				cordonedNodes = append(cordonedNodes, node)
+				untaintedNodes = append(untaintedNodes, node)
 				continue
 			}
 			if _, tainted := k8s.GetToBeRemovedTaint(node); !tainted {
@@ -216,10 +217,48 @@ func (c *Controller) scaleNodeGroup(nodegroup string, nodeGroup *NodeGroupState)
 
 	// We want to be really simple right now so we don't do anything if we are outside the range of allowed nodes
 	// We assume it is a config error or something bad has gone wrong in the cluster
-	if len(allNodes) == 0 {
-		err = errors.New("no nodes remaining")
-		log.WithField("nodegroup", nodegroup).Warning(err.Error())
-		return 0, err
+	if len(untaintedNodes) == 0 {
+	//	err = errors.New("no nodes remaining")
+	//	log.WithField("nodegroup", nodegroup).Warning(err.Error())
+	//	return 0, err
+	    if len(pods) > 0 {
+			locked := nodeGroup.scaleUpLock.locked()
+			if locked {
+				// don't do anything else until we're unlocked again
+				log.WithField("nodegroup", nodegroup).Info(nodeGroup.scaleUpLock)
+				log.WithField("nodegroup", nodegroup).Info("Waiting for scale to finish")
+				return nodeGroup.scaleUpLock.requestedNodes, nil
+			}
+
+			var nodesDelta= nodeGroup.Opts.ScaleUpInitNodes
+
+			scaleOptions := scaleOpts{
+				nodes:          allNodes,
+				taintedNodes:   taintedNodes,
+				untaintedNodes: untaintedNodes,
+				nodeGroup:      nodeGroup,
+				nodesDelta:     nodesDelta,
+			}
+
+			var nodesDeltaResult, actionErr= c.ScaleUp(scaleOptions)
+
+			if actionErr != nil {
+				switch actionErr.(type) {
+				// early return when node is NOT in expected node group
+				case *cloudprovider.NodeNotInNodeGroup:
+					return 0, actionErr
+				default:
+					log.WithField("nodegroup", nodegroup).Error(actionErr)
+				}
+			}
+			log.WithField("nodegroup", nodegroup).Debugf("DeltaScaled: %v", nodesDeltaResult)
+
+			nodeGroup.lastScaleOut = time.Now()
+
+			return nodesDelta, nil
+		} else {
+			return 0, nil
+		}
 	}
 	if len(allNodes) < nodeGroup.Opts.MinNodes {
 		err = errors.New("node count less than the minimum")
