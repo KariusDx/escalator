@@ -216,6 +216,29 @@ func (c *Controller) scaleNodeGroup(nodegroup string, nodeGroup *NodeGroupState)
 	metrics.NodeGroupPods.WithLabelValues(nodegroup).Set(float64(len(pods)))
 
 
+	if len(allNodes) < nodeGroup.Opts.MinNodes {
+		err = errors.New("node count less than the minimum")
+		log.WithField("nodegroup", nodegroup).Warningf(
+			"Node count of %v less than minimum of %v",
+			len(allNodes),
+			nodeGroup.Opts.MinNodes,
+		)
+		return 0, err
+	}
+	if len(allNodes) > nodeGroup.Opts.MaxNodes {
+		err = errors.New("node count larger than the maximum")
+		log.WithField("nodegroup", nodegroup).Warningf(
+			"Node count of %v larger than maximum of %v",
+			len(allNodes),
+			nodeGroup.Opts.MaxNodes,
+		)
+		return 0, err
+	}
+
+	// update the map of node to nodeinfo
+	// for working out which pods are on which nodes
+	nodeGroup.NodeInfoMap = k8s.CreateNodeNameToInfoMap(pods, allNodes)
+
 	nodesDelta := 0
 
 	//Below to calcualte the nodes delta.
@@ -242,28 +265,6 @@ func (c *Controller) scaleNodeGroup(nodegroup string, nodeGroup *NodeGroupState)
 			nodesDelta = -nodeGroup.Opts.FastNodeRemovalRate
 		}
 	} else {
-		if len(allNodes) < nodeGroup.Opts.MinNodes {
-			err = errors.New("node count less than the minimum")
-			log.WithField("nodegroup", nodegroup).Warningf(
-				"Node count of %v less than minimum of %v",
-				len(allNodes),
-				nodeGroup.Opts.MinNodes,
-			)
-			return 0, err
-		}
-		if len(allNodes) > nodeGroup.Opts.MaxNodes {
-			err = errors.New("node count larger than the maximum")
-			log.WithField("nodegroup", nodegroup).Warningf(
-				"Node count of %v larger than maximum of %v",
-				len(allNodes),
-				nodeGroup.Opts.MaxNodes,
-			)
-			return 0, err
-		}
-
-		// update the map of node to nodeinfo
-		// for working out which pods are on which nodes
-		nodeGroup.NodeInfoMap = k8s.CreateNodeNameToInfoMap(pods, allNodes)
 
 		// Calc capacity for untainted nodes
 		memRequest, cpuRequest, err := k8s.CalculatePodsRequestsTotal(pods)
