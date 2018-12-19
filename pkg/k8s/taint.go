@@ -23,7 +23,7 @@ const (
 	// ToBeRemovedByAutoscalerKey specifies the key the autoscaler uses to taint nodes as MARKED
 	ToBeRemovedByAutoscalerKey = "atlassian.com/escalator"
 	// MaximumTaints we can taint at one time
-	MaximumTaints = 10
+	MaximumTaints = 50
 )
 
 var (
