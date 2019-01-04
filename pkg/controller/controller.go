@@ -135,8 +135,6 @@ func (c *Controller) filterNodes(nodeGroup *NodeGroupState, allNodes []*v1.Node)
 			// If the node is Unschedulable (cordoned), separate it out from the tainted/untainted
 			if node.Spec.Unschedulable {
 				cordonedNodes = append(cordonedNodes, node)
-				untaintedNodes = append(untaintedNodes, node)
-				continue
 			}
 			if _, tainted := k8s.GetToBeRemovedTaint(node); !tainted {
 				untaintedNodes = append(untaintedNodes, node)
